@@ -23,6 +23,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import datetime as dt
 import gzip
+import hashlib
 import html
 import io
 import os
@@ -33,6 +34,9 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
+
+# User-local timezone for snapping dummy programme blocks to a clean midnight.
+USER_TZ_OFFSET = dt.timedelta(hours=3)  # GMT+3
 
 # ---------------- epgshare01 sources ----------------
 
@@ -127,24 +131,109 @@ ATTR_RE = re.compile(r'(\b[\w-]+)="([^"]*)"')
 
 
 def parse_m3u(text: str):
-    """Return list of dicts: tvg_id, tvg_name, group, title. Order-independent."""
+    """Return list of dicts: tvg_id, tvg_name, group, title, extinf_line, url_line, line_index.
+
+    Order-independent attribute parsing. Captures the original lines so we can
+    rewrite the M3U later while preserving everything except tvg-id.
+    """
     out = []
-    for line in text.splitlines():
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         if not line.startswith("#EXTINF"):
+            i += 1
             continue
         m = EXTINF_LINE_RE.match(line)
         title = m.group(1).strip() if m else ""
-        # Attribute portion is everything before the comma+title
         comma_idx = line.find(",")
         attr_str = line[: comma_idx if comma_idx > 0 else len(line)]
         attrs = dict(ATTR_RE.findall(attr_str))
+        # The following non-EXTINF lines (vlcopt, kodiprop, etc.) plus the URL
+        # belong to this entry. Collect them all.
+        following = []
+        j = i + 1
+        while j < len(lines) and lines[j].startswith("#"):
+            following.append(lines[j])
+            j += 1
+        url_line = lines[j] if j < len(lines) else ""
         out.append({
             "tvg_id": attrs.get("tvg-id", "").strip(),
             "tvg_name": attrs.get("tvg-name", "").strip(),
             "group": attrs.get("group-title", "").strip(),
             "title": title,
+            "extinf_line": line,
+            "extra_lines": following,
+            "url_line": url_line,
         })
+        i = j + 1
     return out
+
+
+# ---------------- auto tvg-id ----------------
+
+AUTO_ID_INVALID = re.compile(r"[^a-z0-9]+")
+AUTO_ID_BORDER = re.compile(r"^[#*=\-_\s]+|[#*=\-_\s]+$")
+
+
+def auto_tvg_id(channel: dict) -> str:
+    """Generate a stable, URL-safe tvg-id from a channel's name.
+
+    Deterministic per name. Suffix '.auto' marks these as generated (so they
+    never collide with the M3U's existing namespace).
+    """
+    name = channel["tvg_name"] or channel["title"]
+    if not name:
+        name = channel["title"] or "channel"
+    s = AUTO_ID_BORDER.sub("", name).lower()
+    s = AUTO_ID_INVALID.sub("-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    if not s:
+        s = "ch" + hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
+    # Append a 4-char hash for stability across name collisions
+    h = hashlib.md5(name.encode("utf-8")).hexdigest()[:4]
+    return f"{s}-{h}.auto"
+
+
+def assign_effective_ids(m3u_channels):
+    """For each M3U channel, set 'effective_id' = original tvg-id if present,
+    else a freshly generated auto id. Returns count of auto-generated."""
+    auto_count = 0
+    for ch in m3u_channels:
+        if ch["tvg_id"]:
+            ch["effective_id"] = ch["tvg_id"]
+        else:
+            ch["effective_id"] = auto_tvg_id(ch)
+            auto_count += 1
+    return auto_count
+
+
+# ---------------- M3U republishing ----------------
+
+TVG_ID_ATTR_RE = re.compile(r'\s*tvg-id="[^"]*"')
+
+
+def republish_m3u(m3u_channels, epg_url: str) -> str:
+    """Emit a modified M3U where every entry has a tvg-id (original or auto).
+
+    First line carries x-tvg-url so smart players auto-detect the EPG.
+    """
+    out = [f'#EXTM3U x-tvg-url="{epg_url}"']
+    for ch in m3u_channels:
+        line = ch["extinf_line"]
+        # Strip any existing tvg-id attribute then insert the effective one
+        # right after #EXTINF:<dur>.
+        line = TVG_ID_ATTR_RE.sub("", line)
+        # Insert tvg-id after first space following #EXTINF token
+        m = re.match(r'(#EXTINF[^\s,]*)\s*(.*?,.*)$', line, re.DOTALL)
+        if m:
+            head, tail = m.group(1), m.group(2)
+            line = f'{head} tvg-id="{ch["effective_id"]}" {tail}'
+        out.append(line)
+        out.extend(ch["extra_lines"])
+        if ch["url_line"]:
+            out.append(ch["url_line"])
+    return "\n".join(out) + "\n"
 
 
 def build_m3u_index(m3u_channels):
@@ -263,8 +352,13 @@ def main():
     m3u_text = m3u_path.read_text(encoding="utf-8", errors="replace")
     m3u_channels = parse_m3u(m3u_text)
     print(f"      M3U entries: {len(m3u_channels)}")
+    auto_n = assign_effective_ids(m3u_channels)
+    print(f"      effective ids assigned: {len(m3u_channels) - auto_n} from M3U, {auto_n} auto-generated")
     tvg_ids, norm_names, callsigns = build_m3u_index(m3u_channels)
-    print(f"      index: {len(tvg_ids)} tvg-ids, {len(norm_names)} norm-names, {len(callsigns)} US callsigns")
+    # Include auto-generated effective ids in the matcher set so an upstream
+    # source with that exact id (rare) still binds.
+    tvg_ids |= {ch["effective_id"] for ch in m3u_channels}
+    print(f"      index: {len(tvg_ids)} tvg-ids (incl. effective), {len(norm_names)} norm-names, {len(callsigns)} US callsigns")
 
     print(f"[2/6] fetching upstream EPGs from epgshare01...")
     upstream_paths = []
@@ -387,31 +481,34 @@ def main():
         print(f"      removed {removed} programmes from overridden channels")
         kept_ids = set(kept_channels.keys())
 
-    # Build map from tvg-id -> M3U display name (prefer tvg-name, else title)
+    # Build map from effective_id -> M3U display name. Every M3U entry now
+    # has an effective_id (original tvg-id or auto-generated).
     m3u_display = {}
     for ch in m3u_channels:
-        tid = ch["tvg_id"]
-        if not tid:
-            continue
+        tid = ch["effective_id"]
         name = ch["tvg_name"] or ch["title"]
         if name and tid not in m3u_display:
             m3u_display[tid] = name
 
     uncovered_ids = (set(m3u_display.keys()) - kept_ids) | forced_ids
     uncovered_ids = {tid for tid in uncovered_ids if tid in m3u_display}
-    print(f"      dummy entries to add: {len(uncovered_ids)}")
+    print(f"      dummy entries to add: {len(uncovered_ids)} (covers every M3U channel)")
 
-    # Generate dummy channel + 3 days of 6-hour programme blocks per channel
-    dummy_channels: list[bytes] = []
-    dummy_programmes: list[bytes] = []
-    now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
-    # Snap to previous 6-hour boundary
-    now = now.replace(hour=(now.hour // 6) * 6)
-    block_starts = [now + dt.timedelta(hours=6 * i) for i in range(12)]  # 3 days
+    # Snap dummy block to local-midnight GMT+3, span 8 days (yesterday + 7).
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    local_now = now_utc + USER_TZ_OFFSET
+    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    block_start_utc = local_midnight - USER_TZ_OFFSET - dt.timedelta(days=1)
+    block_stop_utc = block_start_utc + dt.timedelta(days=8)
 
     def fmt_xmltv_time(t: dt.datetime) -> str:
         return t.strftime("%Y%m%d%H%M%S +0000")
 
+    start_str = fmt_xmltv_time(block_start_utc)
+    stop_str = fmt_xmltv_time(block_stop_utc)
+
+    dummy_channels: list[bytes] = []
+    dummy_programmes: list[bytes] = []
     for tid in sorted(uncovered_ids):
         name_xml = html.escape(m3u_display[tid], quote=True)
         tid_xml = html.escape(tid, quote=True)
@@ -419,14 +516,11 @@ def main():
             f'<channel id="{tid_xml}"><display-name>{name_xml}</display-name></channel>'
         ).encode("utf-8")
         dummy_channels.append(ch_block)
-        for i in range(len(block_starts) - 1):
-            start = fmt_xmltv_time(block_starts[i])
-            stop = fmt_xmltv_time(block_starts[i + 1])
-            p = (
-                f'<programme start="{start}" stop="{stop}" channel="{tid_xml}">'
-                f'<title lang="en">No EPG</title></programme>'
-            ).encode("utf-8")
-            dummy_programmes.append(p)
+        p = (
+            f'<programme start="{start_str}" stop="{stop_str}" channel="{tid_xml}">'
+            f'<title lang="en">No EPG</title></programme>'
+        ).encode("utf-8")
+        dummy_programmes.append(p)
 
     for blk in dummy_channels:
         m = CHANNEL_ID_RE.search(blk)
@@ -435,7 +529,7 @@ def main():
             kept_channels[cid] = blk
             kept_ids.add(cid)
     kept_programmes.extend(dummy_programmes)
-    print(f"      added {len(dummy_channels)} dummy channels, {len(dummy_programmes)} dummy programmes")
+    print(f"      added {len(dummy_channels)} dummy channels (single 8-day block each)")
 
     print(f"[6/6] writing output...")
     out_xml = out_dir / "guide.xml"
@@ -491,6 +585,14 @@ def main():
 
     print(f"      wrote {out_xml} ({out_xml.stat().st_size//1024} KB) — titles only")
     print(f"      wrote {out_gz} ({out_gz.stat().st_size//1024} KB) — full data, gzipped")
+
+    # Republish the M3U with every entry carrying a tvg-id (original or auto).
+    out_m3u = out_dir / "playlist.m3u"
+    pages_base = os.environ.get("PAGES_BASE", "https://al7omed.github.io/iptv-epg")
+    epg_link = f"{pages_base}/guide.xml.gz"
+    out_m3u.write_text(republish_m3u(m3u_channels, epg_link), encoding="utf-8")
+    print(f"      wrote {out_m3u} ({out_m3u.stat().st_size//1024} KB)")
+
     print()
     print("=== source breakdown (channels) ===")
     for src, n in source_stats.items():
