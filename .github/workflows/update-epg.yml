@@ -1,0 +1,56 @@
+name: Update EPG
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/build_epg.py'
+      - '.github/workflows/update-epg.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-epg
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      M3U_URL: ${{ secrets.M3U_URL }}
+      PROVIDER_EPG_URL: ${{ secrets.PROVIDER_EPG_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build EPG
+        run: python3 scripts/build_epg.py
+
+      - name: Stats
+        run: |
+          echo "guide.xml:    $(stat -c '%s' docs/guide.xml) bytes"
+          echo "guide.xml.gz: $(stat -c '%s' docs/guide.xml.gz) bytes"
+          echo "channels:     $(grep -c '<channel ' docs/guide.xml)"
+          echo "programmes:   $(grep -c '<programme ' docs/guide.xml)"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/guide.xml docs/guide.xml.gz
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update EPG $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+          fi
