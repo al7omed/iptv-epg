@@ -208,32 +208,28 @@ def assign_effective_ids(m3u_channels):
     return auto_count
 
 
-# ---------------- M3U republishing ----------------
+# ---------------- tvg-id map (replacement for M3U republish) ----------------
+#
+# We do NOT publish the M3U publicly because it contains the user's IPTV
+# stream URLs with embedded auth tokens. Instead we publish a CSV mapping of
+# (channel-name -> effective tvg-id) which is non-sensitive. The user runs
+# scripts/patch_m3u.py locally to inject these tvg-ids into their local M3U.
 
-TVG_ID_ATTR_RE = re.compile(r'\s*tvg-id="[^"]*"')
 
-
-def republish_m3u(m3u_channels, epg_url: str) -> str:
-    """Emit a modified M3U where every entry has a tvg-id (original or auto).
-
-    First line carries x-tvg-url so smart players auto-detect the EPG.
+def write_tvg_id_map(m3u_channels, dest: Path) -> int:
+    """Write a CSV: tvg_name|title|tvg_id|effective_id, one row per M3U entry.
+    Uses tab separator since channel names contain commas. Returns row count.
     """
-    out = [f'#EXTM3U x-tvg-url="{epg_url}"']
+    rows = ["tvg_name\ttitle\toriginal_tvg_id\teffective_tvg_id"]
     for ch in m3u_channels:
-        line = ch["extinf_line"]
-        # Strip any existing tvg-id attribute then insert the effective one
-        # right after #EXTINF:<dur>.
-        line = TVG_ID_ATTR_RE.sub("", line)
-        # Insert tvg-id after first space following #EXTINF token
-        m = re.match(r'(#EXTINF[^\s,]*)\s*(.*?,.*)$', line, re.DOTALL)
-        if m:
-            head, tail = m.group(1), m.group(2)
-            line = f'{head} tvg-id="{ch["effective_id"]}" {tail}'
-        out.append(line)
-        out.extend(ch["extra_lines"])
-        if ch["url_line"]:
-            out.append(ch["url_line"])
-    return "\n".join(out) + "\n"
+        rows.append("\t".join([
+            ch["tvg_name"].replace("\t", " ").replace("\n", " "),
+            ch["title"].replace("\t", " ").replace("\n", " "),
+            ch["tvg_id"],
+            ch["effective_id"],
+        ]))
+    dest.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return len(m3u_channels)
 
 
 def build_m3u_index(m3u_channels):
@@ -490,9 +486,83 @@ def main():
         if name and tid not in m3u_display:
             m3u_display[tid] = name
 
+    # ---------- backfill pass ----------
+    # An upstream/provider channel often matches an M3U entry via callsign or
+    # name, but the player binds by tvg-id strictly. Find those mismatches and
+    # clone the upstream's channel+programmes under the M3U's effective_id so
+    # real EPG data is actually displayed.
+    print(f"[5c]  backfill pass (rewire upstream data to M3U effective ids)")
+    backfill_cs: dict[str, str] = {}
+    backfill_nn: dict[str, str] = {}
+    for cid, block in kept_channels.items():
+        names = [n.decode("utf-8", "replace") for n in DISPLAY_NAME_RE.findall(block)]
+        for n in names:
+            cs = extract_callsign(n)
+            if cs:
+                backfill_cs.setdefault(cs, cid)
+            nn = normalize_name(n)
+            if nn and len(nn) > 3:
+                backfill_nn.setdefault(nn, cid)
+        cid_cs = _strip_us_callsign_suffix(cid.split(".")[0].upper())
+        if 3 <= len(cid_cs) <= 5 and cid_cs[0] in ("K", "W"):
+            backfill_cs.setdefault(cid_cs, cid)
+
+    progs_by_chan: dict[str, list[bytes]] = {}
+    for p in kept_programmes:
+        m = PROG_CHANNEL_RE.search(p)
+        if m:
+            sid = m.group(1).decode("utf-8", "replace")
+            progs_by_chan.setdefault(sid, []).append(p)
+
+    def rewrite_channel_id(block: bytes, old: str, new: str) -> bytes:
+        return re.sub(
+            rb'(<channel\b[^>]*?\bid=")' + re.escape(old.encode()) + rb'(")',
+            lambda m: m.group(1) + new.encode() + m.group(2),
+            block, count=1,
+        )
+
+    def rewrite_prog_channel(block: bytes, old: str, new: str) -> bytes:
+        return re.sub(
+            rb'(<programme\b[^>]*?\bchannel=")' + re.escape(old.encode()) + rb'(")',
+            lambda m: m.group(1) + new.encode() + m.group(2),
+            block, count=1,
+        )
+
+    backfilled = 0
+    backfill_progs = 0
+    backfill_added_programmes: list[bytes] = []
+    for ch in m3u_channels:
+        tid = ch["effective_id"]
+        if tid in kept_ids or tid in forced_ids:
+            continue
+        candidate_cid = None
+        for nm in (ch["tvg_name"], ch["title"]):
+            if not nm:
+                continue
+            cs = extract_callsign(nm)
+            if cs and cs in backfill_cs:
+                candidate_cid = backfill_cs[cs]
+                break
+            nn = normalize_name(nm)
+            if nn and nn in backfill_nn:
+                candidate_cid = backfill_nn[nn]
+                break
+        if not candidate_cid:
+            continue
+        src_block = kept_channels[candidate_cid]
+        new_block = rewrite_channel_id(src_block, candidate_cid, tid)
+        kept_channels[tid] = new_block
+        kept_ids.add(tid)
+        backfilled += 1
+        for src_prog in progs_by_chan.get(candidate_cid, []):
+            backfill_added_programmes.append(rewrite_prog_channel(src_prog, candidate_cid, tid))
+            backfill_progs += 1
+    kept_programmes.extend(backfill_added_programmes)
+    print(f"      backfilled {backfilled} M3U ids (+{backfill_progs} cloned programmes)")
+
     uncovered_ids = (set(m3u_display.keys()) - kept_ids) | forced_ids
     uncovered_ids = {tid for tid in uncovered_ids if tid in m3u_display}
-    print(f"      dummy entries to add: {len(uncovered_ids)} (covers every M3U channel)")
+    print(f"      dummy entries to add: {len(uncovered_ids)} (covers every remaining M3U channel)")
 
     # Snap dummy block to local-midnight GMT+3, span 8 days (yesterday + 7).
     now_utc = dt.datetime.now(dt.timezone.utc)
@@ -586,12 +656,12 @@ def main():
     print(f"      wrote {out_xml} ({out_xml.stat().st_size//1024} KB) — titles only")
     print(f"      wrote {out_gz} ({out_gz.stat().st_size//1024} KB) — full data, gzipped")
 
-    # Republish the M3U with every entry carrying a tvg-id (original or auto).
-    out_m3u = out_dir / "playlist.m3u"
-    pages_base = os.environ.get("PAGES_BASE", "https://al7omed.github.io/iptv-epg")
-    epg_link = f"{pages_base}/guide.xml.gz"
-    out_m3u.write_text(republish_m3u(m3u_channels, epg_link), encoding="utf-8")
-    print(f"      wrote {out_m3u} ({out_m3u.stat().st_size//1024} KB)")
+    # Publish the non-sensitive tvg-id map. The user uses patch_m3u.py locally
+    # to inject these tvg-ids into their private M3U. We do NOT publish the
+    # full M3U because it embeds the user's stream auth tokens.
+    out_map = out_dir / "tvg-id-map.tsv"
+    written = write_tvg_id_map(m3u_channels, out_map)
+    print(f"      wrote {out_map} ({out_map.stat().st_size//1024} KB, {written} rows)")
 
     print()
     print("=== source breakdown (channels) ===")

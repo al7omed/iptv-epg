@@ -43,14 +43,21 @@ jobs:
           echo "channels:     $(grep -c '<channel ' docs/guide.xml)"
           echo "programmes:   $(grep -c '<programme ' docs/guide.xml)"
 
+      - name: Ensure playlist.m3u stays purged
+        run: |
+          # Safety: if a stale playlist.m3u somehow appears in the working tree,
+          # remove it before committing. We do not publish the M3U publicly.
+          rm -f docs/playlist.m3u
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/guide.xml docs/guide.xml.gz docs/playlist.m3u
+          git add docs/guide.xml docs/guide.xml.gz docs/tvg-id-map.tsv
+          # Also stage deletion if playlist.m3u happens to be tracked.
+          git rm --cached --ignore-unmatch docs/playlist.m3u >/dev/null 2>&1 || true
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "Update EPG + M3U $(date -u +%Y-%m-%dT%H:%MZ)"
+            git commit -m "Update EPG + map $(date -u +%Y-%m-%dT%H:%MZ)"
             git push
           fi

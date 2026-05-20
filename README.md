@@ -1,70 +1,79 @@
 # iptv-epg
 
-Self-updating unified XMLTV EPG for the IPTV playlist. Merges per-region guides from [epgshare01.online](https://epgshare01.online/epgshare01/) with the provider's own EPG, filters down to channels referenced by the M3U, and republishes on a 12-hour cron.
+Self-updating unified XMLTV EPG for the IPTV playlist. Merges per-region guides from [epgshare01.online](https://epgshare01.online/epgshare01/) with the provider's own EPG, backfills the user's M3U channel ids, and adds a "No EPG" dummy programme for any remaining unmatched channel — so every entry in the M3U has data in the player grid.
 
-## EPG URLs
+## What to paste into your player
 
-Paste **one** of these into your IPTV player as the EPG / TV-guide source:
+**EPG URL** (recommended — 12 MB gzipped, full programme descriptions):
 
 ```
 https://al7omed.github.io/iptv-epg/guide.xml.gz
 ```
 
-(Recommended — 12 MB, gzipped, includes full programme descriptions.)
+**EPG fallback** (titles only, uncompressed, for players that won't read `.gz`):
 
 ```
 https://al7omed.github.io/iptv-epg/guide.xml
 ```
 
-(Fallback — 34 MB uncompressed, titles only. Use only if your player doesn't accept `.gz` URLs.)
+For the EPG to bind to **every channel** in your M3U — including the ~14k that have no `tvg-id` in the original — you also need to patch your local M3U once. See "Patching the M3U" below.
+
+## Why the M3U isn't published
+
+Your IPTV M3U contains stream URLs with embedded auth tokens (`/live/<token>/<token>/<id>.ts`). Hosting that file publicly would leak your subscription. Instead, this repo publishes a small **non-sensitive map**:
+
+```
+https://al7omed.github.io/iptv-epg/tvg-id-map.tsv
+```
+
+Each row is `tvg-name<TAB>title<TAB>original_tvg_id<TAB>effective_tvg_id`. No URLs, no tokens.
+
+## Patching the M3U
+
+Run `scripts/patch_m3u.py` locally — it downloads the map, injects `tvg-id`s into a copy of your M3U, and writes a new file:
+
+```sh
+# one-time: save your original M3U locally
+curl -fsSL "<your private M3U URL>" -o ~/Downloads/playlist.m3u
+
+# patch it with auto tvg-ids
+python3 scripts/patch_m3u.py ~/Downloads/playlist.m3u ~/Downloads/playlist_patched.m3u
+```
+
+Then in your IPTV player:
+- **M3U source**: point at the file path you wrote (or move it to your player's storage)
+- **EPG source**: `https://al7omed.github.io/iptv-epg/guide.xml.gz`
+
+Re-run the patch script whenever the published map updates (whenever channels are added/removed from your provider's M3U). The mapping is deterministic — same channel name always produces the same `tvg-id`, so the EPG stays bound.
 
 ## How it works
 
-The Python script in `scripts/build_epg.py`:
-1. Fetches the M3U playlist (URL stored as a GitHub Secret).
-2. Builds an index of every channel — tvg-ids, normalized display-names, US-station callsigns.
-3. Downloads the following XMLTV files from epgshare01.online: `US2`, `US_LOCALS1`, `US_SPORTS1`, `UK1`, `BEIN1`, `ALJAZEERA1`, `AE1`.
-4. Fetches the provider's own EPG (URL in a Secret) and includes its channels verbatim — the provider already curated multi-alias display-name mappings for ~168 premium UK Sky / AR beIN channels.
-5. For each upstream channel, keeps it only if the M3U references it (by tvg-id, by normalized name match, or — for US locals — by callsign match like `KNBC` → `KNBC-DT.us_locals1`).
-6. Dedupes programmes by `(channel, start)` — provider EPG wins when sources collide.
-7. Writes two files: `docs/guide.xml.gz` (full data) and `docs/guide.xml` (titles only, fits under Pages' 100 MB limit).
-8. Commits to `main`. GitHub Pages serves `docs/`.
+The build runs every 12 hours via GitHub Actions:
 
-## Realistic coverage
+1. Fetches your M3U (URL stored as `M3U_URL` Secret).
+2. Assigns an `effective_id` to every entry — original `tvg-id` if present, else a stable auto-generated id from the channel name.
+3. Downloads epgshare01 files: `US2`, `US_LOCALS1`, `US_SPORTS1`, `UK1`, `BEIN1`, `ALJAZEERA1`, `AE1`.
+4. Fetches your provider EPG (URL stored as `PROVIDER_EPG_URL` Secret) and includes its channels verbatim — provider has the best display-name alias mappings for ~168 premium UK Sky / AR beIN channels.
+5. For each upstream channel, keeps it if it matches an M3U entry (direct tvg-id, name, or US callsign).
+6. Dedupes programmes by `(channel, start)` — provider EPG wins on collisions.
+7. **Backfill pass**: rewires upstream channel ids to their corresponding M3U `effective_id` so the player actually binds to the real data (otherwise the upstream id like `KNBC-DT.us_locals1` wouldn't match the M3U's `nbc-4-knbc-los-angeles-xxxx.auto`).
+8. **Dummy pass**: every remaining `effective_id` not yet covered gets a single 8-day "No EPG" `<programme>` block, snapped to GMT+3 midnight.
+9. Writes `docs/guide.xml.gz`, `docs/guide.xml`, and `docs/tvg-id-map.tsv`. Pages serves them.
 
-The M3U has ~18,000 channels but most are PPV/event slots or "DUMP" placeholders that no upstream source has EPG for. The build produces guides for **~1,500 real channels**:
+## Confidence tiers
 
-| Source | Channels added |
-|---|---|
-| Provider EPG (verbatim) | 168 |
-| US_LOCALS1 (US affiliates by callsign) | ~727 |
-| US2 (US cable/national) | ~200 |
-| US_SPORTS1 (US regional sports) | ~73 |
-| UK1 (UK broadcast) | ~187 |
-| AE1 (UAE / MENA Arabic) | ~190 |
-| ALJAZEERA1 | ~1 |
-| BEIN1 | 0 (already in provider EPG) |
+The pipeline uses sources that themselves aggregate from real-world TV listings (DirecTV, Spectrum, Sky, beIN's own opta API, etc.). Match tiers, ordered by typical accuracy:
 
-Channels in `ALL PPV`, `DUMP`, `8K SPORT ON AIR`, and other RAW event groups remain without EPG — they aren't real scheduled channels.
+| Tier | What | Approx. accuracy |
+|---|---|---|
+| 1 | Provider EPG (verbatim) | ~100% (provider curated) |
+| 2 | beIN MENA via beinsports.com API ([bein-epg repo](https://github.com/al7omed/bein-epg)) | ~95% (source-of-truth) |
+| 3 | epgshare01 direct tvg-id match | ~95% |
+| 4 | epgshare01 callsign match (e.g. `KNBC` → `KNBC-DT.us_locals1`) | ~80–90% |
+| 5 | epgshare01 normalized-name match | ~75–90% |
+| 6 | Dummy "No EPG" block | n/a — honest blank |
 
-### Dummy EPG for uncovered channels
-
-For every M3U channel that has a `tvg-id` but no upstream EPG match (and for every entry in `channels/dummy_override.txt`), the build adds a placeholder `<channel>` and a series of 6-hour "No EPG" `<programme>` blocks covering the next 3 days. Players that would otherwise leave the row blank now show a uniform grid.
-
-Channels without any `tvg-id` in the M3U can't be helped this way — the player has nothing to bind against. If you want to fix those too, we'd need to republish a modified M3U with auto-generated tvg-ids.
-
-### Marking a channel as inaccurate
-
-If an upstream EPG source matched the wrong programme data to a channel, add the tvg-id to `channels/dummy_override.txt` (one per line, `#` for comments). The real data is dropped and a dummy is used instead.
-
-## Configuration
-
-Two GitHub Secrets drive the build:
-
-- `M3U_URL` — the user's M3U playlist URL (with the live-only filter applied).
-- `PROVIDER_EPG_URL` — the provider's existing XMLTV URL. Optional but recommended; it covers premium UK Sky / AR beIN channels well.
-
-These are never written to disk in the repo or echoed in logs. The Actions runner has access at build time via the env vars.
+There is no programmatic 70%-certainty oracle for every channel — TV networks don't all publish open APIs. If you spot a channel with wrong data, add its `effective_tvg_id` (from the map) to `channels/dummy_override.txt` and the build will drop that channel's upstream data and use a dummy instead.
 
 ## Manual refresh
 
@@ -72,9 +81,15 @@ These are never written to disk in the repo or echoed in logs. The Actions runne
 gh workflow run update-epg.yml -R al7omed/iptv-epg
 ```
 
-## Adding sources or tweaking matching
+## Configuration
 
-- To add another country: edit `EPGSHARE_FILES` at the top of `scripts/build_epg.py`. Check the file exists at `https://epgshare01.online/epgshare01/epg_ripper_<NAME>.xml.gz` first.
-- To tweak name normalization: edit `normalize_name()` and `extract_callsign()`. The matching is fuzzy by design — adjust the prefix/suffix strip lists for new naming patterns in the M3U.
+Two GitHub Secrets drive the build:
 
-Commit changes and the workflow runs automatically (it triggers on changes to `scripts/build_epg.py`).
+- `M3U_URL` — your M3U playlist URL (with the live-only filter applied).
+- `PROVIDER_EPG_URL` — your provider's existing XMLTV URL. Optional but recommended.
+
+Neither is written to disk in the repo or echoed in logs.
+
+## Sister repo
+
+[al7omed/bein-epg](https://github.com/al7omed/bein-epg) — a focused, higher-fidelity EPG for beIN Sports MENA only (24 channels), scraped directly from beinsports.com's opta API. Use both EPGs for best results.
