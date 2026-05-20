@@ -21,7 +21,9 @@ already curated alias mappings for ~168 channels.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import datetime as dt
 import gzip
+import html
 import io
 import os
 import re
@@ -361,6 +363,79 @@ def main():
         deduped.append(block)
     kept_programmes = deduped
     print(f"      total kept programmes (after dedupe): {len(kept_programmes)}")
+
+    # ---------- dummy entries for uncovered tvg-ids ----------
+    # Force-dummy list: tvg-ids the user marked as inaccurate. These get their
+    # real EPG removed and replaced with dummies.
+    override_path = Path("channels/dummy_override.txt")
+    forced_ids: set[str] = set()
+    if override_path.exists():
+        for line in override_path.read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                forced_ids.add(line)
+    print(f"[5b]  dummy override list: {len(forced_ids)} entries")
+
+    if forced_ids:
+        kept_channels = {cid: blk for cid, blk in kept_channels.items() if cid not in forced_ids}
+        before = len(kept_programmes)
+        kept_programmes = [
+            blk for blk in kept_programmes
+            if not (m := PROG_CHANNEL_RE.search(blk)) or m.group(1).decode("utf-8", "replace") not in forced_ids
+        ]
+        removed = before - len(kept_programmes)
+        print(f"      removed {removed} programmes from overridden channels")
+        kept_ids = set(kept_channels.keys())
+
+    # Build map from tvg-id -> M3U display name (prefer tvg-name, else title)
+    m3u_display = {}
+    for ch in m3u_channels:
+        tid = ch["tvg_id"]
+        if not tid:
+            continue
+        name = ch["tvg_name"] or ch["title"]
+        if name and tid not in m3u_display:
+            m3u_display[tid] = name
+
+    uncovered_ids = (set(m3u_display.keys()) - kept_ids) | forced_ids
+    uncovered_ids = {tid for tid in uncovered_ids if tid in m3u_display}
+    print(f"      dummy entries to add: {len(uncovered_ids)}")
+
+    # Generate dummy channel + 3 days of 6-hour programme blocks per channel
+    dummy_channels: list[bytes] = []
+    dummy_programmes: list[bytes] = []
+    now = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+    # Snap to previous 6-hour boundary
+    now = now.replace(hour=(now.hour // 6) * 6)
+    block_starts = [now + dt.timedelta(hours=6 * i) for i in range(12)]  # 3 days
+
+    def fmt_xmltv_time(t: dt.datetime) -> str:
+        return t.strftime("%Y%m%d%H%M%S +0000")
+
+    for tid in sorted(uncovered_ids):
+        name_xml = html.escape(m3u_display[tid], quote=True)
+        tid_xml = html.escape(tid, quote=True)
+        ch_block = (
+            f'<channel id="{tid_xml}"><display-name>{name_xml}</display-name></channel>'
+        ).encode("utf-8")
+        dummy_channels.append(ch_block)
+        for i in range(len(block_starts) - 1):
+            start = fmt_xmltv_time(block_starts[i])
+            stop = fmt_xmltv_time(block_starts[i + 1])
+            p = (
+                f'<programme start="{start}" stop="{stop}" channel="{tid_xml}">'
+                f'<title lang="en">No EPG</title></programme>'
+            ).encode("utf-8")
+            dummy_programmes.append(p)
+
+    for blk in dummy_channels:
+        m = CHANNEL_ID_RE.search(blk)
+        if m:
+            cid = m.group(1).decode("utf-8", "replace")
+            kept_channels[cid] = blk
+            kept_ids.add(cid)
+    kept_programmes.extend(dummy_programmes)
+    print(f"      added {len(dummy_channels)} dummy channels, {len(dummy_programmes)} dummy programmes")
 
     print(f"[6/6] writing output...")
     out_xml = out_dir / "guide.xml"

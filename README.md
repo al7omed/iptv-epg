@@ -47,6 +47,16 @@ The M3U has ~18,000 channels but most are PPV/event slots or "DUMP" placeholders
 
 Channels in `ALL PPV`, `DUMP`, `8K SPORT ON AIR`, and other RAW event groups remain without EPG — they aren't real scheduled channels.
 
+### Dummy EPG for uncovered channels
+
+For every M3U channel that has a `tvg-id` but no upstream EPG match (and for every entry in `channels/dummy_override.txt`), the build adds a placeholder `<channel>` and a series of 6-hour "No EPG" `<programme>` blocks covering the next 3 days. Players that would otherwise leave the row blank now show a uniform grid.
+
+Channels without any `tvg-id` in the M3U can't be helped this way — the player has nothing to bind against. If you want to fix those too, we'd need to republish a modified M3U with auto-generated tvg-ids.
+
+### Marking a channel as inaccurate
+
+If an upstream EPG source matched the wrong programme data to a channel, add the tvg-id to `channels/dummy_override.txt` (one per line, `#` for comments). The real data is dropped and a dummy is used instead.
+
 ## Configuration
 
 Two GitHub Secrets drive the build:
