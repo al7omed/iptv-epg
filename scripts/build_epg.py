@@ -564,18 +564,26 @@ def main():
     uncovered_ids = {tid for tid in uncovered_ids if tid in m3u_display}
     print(f"      dummy entries to add: {len(uncovered_ids)} (covers every remaining M3U channel)")
 
-    # Snap dummy block to local-midnight GMT+3, span 8 days (yesterday + 7).
+    # Generate dummy programme blocks. Many IPTV players (UHF on tvOS, some
+    # TiviMate builds) refuse to render programmes longer than ~24h and show
+    # "data unavailable" instead. So we emit 4-hour blocks for 8 days = 48
+    # blocks per channel. Snapped to GMT+3 hour boundaries.
+    BLOCK_HOURS = 4
+    DAYS_AHEAD = 8
     now_utc = dt.datetime.now(dt.timezone.utc)
     local_now = now_utc + USER_TZ_OFFSET
     local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    block_start_utc = local_midnight - USER_TZ_OFFSET - dt.timedelta(days=1)
-    block_stop_utc = block_start_utc + dt.timedelta(days=8)
+    series_start_utc = local_midnight - USER_TZ_OFFSET - dt.timedelta(days=1)
+    n_blocks = (DAYS_AHEAD * 24) // BLOCK_HOURS
 
     def fmt_xmltv_time(t: dt.datetime) -> str:
         return t.strftime("%Y%m%d%H%M%S +0000")
 
-    start_str = fmt_xmltv_time(block_start_utc)
-    stop_str = fmt_xmltv_time(block_stop_utc)
+    block_times = []
+    for i in range(n_blocks):
+        s = series_start_utc + dt.timedelta(hours=i * BLOCK_HOURS)
+        e = s + dt.timedelta(hours=BLOCK_HOURS)
+        block_times.append((fmt_xmltv_time(s), fmt_xmltv_time(e)))
 
     dummy_channels: list[bytes] = []
     dummy_programmes: list[bytes] = []
@@ -586,11 +594,12 @@ def main():
             f'<channel id="{tid_xml}"><display-name>{name_xml}</display-name></channel>'
         ).encode("utf-8")
         dummy_channels.append(ch_block)
-        p = (
-            f'<programme start="{start_str}" stop="{stop_str}" channel="{tid_xml}">'
-            f'<title lang="en">No EPG</title></programme>'
-        ).encode("utf-8")
-        dummy_programmes.append(p)
+        for s_str, e_str in block_times:
+            p = (
+                f'<programme start="{s_str}" stop="{e_str}" channel="{tid_xml}">'
+                f'<title lang="en">No EPG</title></programme>'
+            ).encode("utf-8")
+            dummy_programmes.append(p)
 
     for blk in dummy_channels:
         m = CHANNEL_ID_RE.search(blk)
@@ -599,7 +608,7 @@ def main():
             kept_channels[cid] = blk
             kept_ids.add(cid)
     kept_programmes.extend(dummy_programmes)
-    print(f"      added {len(dummy_channels)} dummy channels (single 8-day block each)")
+    print(f"      added {len(dummy_channels)} dummy channels × {n_blocks} blocks = {len(dummy_programmes)} programmes")
 
     print(f"[6/6] writing output...")
     out_xml = out_dir / "guide.xml"
@@ -612,7 +621,9 @@ def main():
     )
     footer = b"</tv>\n"
 
-    # Full version (gzipped) — keeps descriptions and all metadata.
+    # Full version (gzipped). Lite uncompressed version was dropped — every
+    # modern player accepts .gz, and the file would otherwise exceed GitHub
+    # Pages' 100 MB per-file limit once dummies are split into many blocks.
     with gzip.open(out_gz, "wb", compresslevel=6) as f:
         f.write(header)
         for cid in sorted(kept_channels):
@@ -623,37 +634,11 @@ def main():
             f.write(b"\n")
         f.write(footer)
 
-    # Lite version (uncompressed) — title-only programmes so file stays under
-    # GitHub Pages' 100 MB per-file limit. Strips <desc>, <credits>, <icon>,
-    # <category>, <rating>, <star-rating>, <country>, <url>, <episode-num>,
-    # <sub-title>, <date>, <language>, <orig-language>, <length>.
-    strip_children = re.compile(
-        rb"<(?:desc|credits|icon|category|rating|star-rating|country|url|"
-        rb"episode-num|sub-title|date|language|orig-language|length|"
-        rb"video|audio|previously-shown|premiere|last-chance|new|"
-        rb"subtitles|review)\b[^>]*?(?:/>|>.*?</(?:desc|credits|icon|"
-        rb"category|rating|star-rating|country|url|episode-num|sub-title|"
-        rb"date|language|orig-language|length|video|audio|"
-        rb"previously-shown|premiere|last-chance|new|subtitles|review)>)",
-        re.DOTALL,
-    )
+    # Strip an old guide.xml if it was committed before this change so Pages
+    # stops serving stale content.
+    if out_xml.exists():
+        out_xml.unlink()
 
-    def strip_programme(block: bytes) -> bytes:
-        return strip_children.sub(b"", block)
-
-    with open(out_xml, "wb") as f:
-        f.write(header)
-        for cid in sorted(kept_channels):
-            # Also strip icons from channel definitions in the lite version
-            chan_stripped = strip_children.sub(b"", kept_channels[cid])
-            f.write(chan_stripped)
-            f.write(b"\n")
-        for p in kept_programmes:
-            f.write(strip_programme(p))
-            f.write(b"\n")
-        f.write(footer)
-
-    print(f"      wrote {out_xml} ({out_xml.stat().st_size//1024} KB) — titles only")
     print(f"      wrote {out_gz} ({out_gz.stat().st_size//1024} KB) — full data, gzipped")
 
     # Publish the non-sensitive tvg-id map. The user uses patch_m3u.py locally

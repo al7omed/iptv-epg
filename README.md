@@ -10,12 +10,6 @@ Self-updating unified XMLTV EPG for the IPTV playlist. Merges per-region guides 
 https://al7omed.github.io/iptv-epg/guide.xml.gz
 ```
 
-**EPG fallback** (titles only, uncompressed, for players that won't read `.gz`):
-
-```
-https://al7omed.github.io/iptv-epg/guide.xml
-```
-
 For the EPG to bind to **every channel** in your M3U — including the ~14k that have no `tvg-id` in the original — you also need to patch your local M3U once. See "Patching the M3U" below.
 
 ## Why the M3U isn't published
